@@ -10,6 +10,9 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
+// API URL - uses environment variable in production, localhost in development
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+
 const Sidebar = () => (
   <div className="sidebar glass">
     <div className="logo" style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '40px' }}>
@@ -45,7 +48,7 @@ function App() {
     setLoading(true);
     setVideoData(null);
     try {
-      const response = await fetch('http://localhost:8000/generate-video', {
+      const response = await fetch(`${API_URL}/generate-video`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt, video_type: videoType })

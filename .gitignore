@@ -16,8 +16,14 @@ env/
 
 # Secrets - NEVER commit!
 app_secrets.py
-*.env
 .env
+backend/.env
+frontend/.env
+
+# Keep example files
+!.env.example
+!backend/.env.example
+!frontend/.env.example
 
 # Generated files
 backend/output/

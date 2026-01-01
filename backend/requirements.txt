@@ -7,3 +7,5 @@ moviepy
 gTTS
 edge-tts
 requests
+numpy
+pillow

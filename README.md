@@ -192,6 +192,33 @@ ACCENT_COLORS = {
 ### TTS Voice
 Default voice: `en-US-ChristopherNeural` (Microsoft Edge TTS)
 
+## 🚀 Deployment
+
+### Deploy Frontend to Vercel
+
+1. Push your code to GitHub
+2. Go to [vercel.com](https://vercel.com) and import your repo
+3. Set the **Root Directory** to `frontend`
+4. Add environment variable:
+   - `VITE_API_URL` = `https://your-backend.railway.app`
+5. Deploy!
+
+### Deploy Backend to Railway
+
+1. Go to [railway.app](https://railway.app) and create new project
+2. Select "Deploy from GitHub repo"
+3. Choose your repo and set **Root Directory** to `backend`
+4. Add environment variable:
+   - `OPENROUTER_API_KEY` = your API key from [OpenRouter](https://openrouter.ai/)
+5. Railway will auto-detect the Dockerfile and deploy!
+
+### Environment Variables
+
+| Variable | Where | Description |
+|----------|-------|-------------|
+| `OPENROUTER_API_KEY` | Backend (Railway) | Your OpenRouter API key |
+| `VITE_API_URL` | Frontend (Vercel) | Your Railway backend URL |
+
 ## 🤝 Contributing
 
 1. Fork the repository

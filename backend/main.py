@@ -21,9 +21,20 @@ import requests
 import random
 import numpy as np
 from fastapi.staticfiles import StaticFiles
-from app_secrets import API_KEY
+from dotenv import load_dotenv
 from PIL import Image
 from io import BytesIO
+
+# Load environment variables
+load_dotenv()
+
+# Get API key from environment or fallback to app_secrets
+API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not API_KEY:
+    try:
+        from app_secrets import API_KEY
+    except ImportError:
+        raise ValueError("OPENROUTER_API_KEY not found in environment or app_secrets.py")
 
 # Create directories if they don't exist
 os.makedirs("backend/output", exist_ok=True)
