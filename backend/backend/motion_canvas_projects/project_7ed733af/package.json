@@ -1,0 +1,17 @@
+{
+  "name": "aetheris-video-7ed733af",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "motion-canvas serve",
+    "build": "motion-canvas render"
+  },
+  "dependencies": {
+    "@motion-canvas/2d": "^3.0.0",
+    "@motion-canvas/core": "^3.0.0"
+  },
+  "devDependencies": {
+    "@motion-canvas/vite-plugin": "^3.0.0",
+    "typescript": "^5.0.0",
+    "vite": "^5.0.0"
+  }
+}

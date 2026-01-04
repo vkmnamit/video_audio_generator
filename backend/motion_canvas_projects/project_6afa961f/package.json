@@ -1,0 +1,21 @@
+{
+  "name": "aetheris-video-6afa961f",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@motion-canvas/core": "^3.16.0",
+    "@motion-canvas/2d": "^3.16.0",
+    "@motion-canvas/ui": "^3.16.0"
+  },
+  "devDependencies": {
+    "@motion-canvas/vite-plugin": "^3.16.0",
+    "@motion-canvas/ffmpeg": "^3.16.0",
+    "puppeteer": "^23.0.0",
+    "typescript": "^5.2.2",
+    "vite": "^5.0.0"
+  }
+}

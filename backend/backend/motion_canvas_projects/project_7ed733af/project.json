@@ -1,0 +1,10 @@
+{
+  "name": "aetheris-7ed733af",
+  "scenes": [
+    "./src/scenes/main.tsx"
+  ],
+  "output": "./output",
+  "fps": 30,
+  "width": 1080,
+  "height": 1920
+}

@@ -1,11 +1,143 @@
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🎬 SCRIPT-ONLY & VIDEO-FROM-SCRIPT ENDPOINTS (for frontend review/edit)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from fastapi import Body
+from pydantic import BaseModel
+from typing import Optional, List, Literal
+
+
+class ScriptRequest(BaseModel):
+    prompt: str
+    themes: Optional[List[Literal[
+        "algorithm",
+        "conceptual",
+        "science",
+        "history",
+        "finance",
+        "general"
+    ]]] = ["conceptual"]
+    video_type: Optional[str] = "short"
+    target_audience: Optional[str] = "students"
+
+class ScriptWithImagesRequest(BaseModel):
+    session_id: str
+    topic: str
+    video_type: Optional[str] = "short"
+    themes: Optional[List[Literal[
+        "algorithm",
+        "conceptual",
+        "science",
+        "history",
+        "finance",
+        "general"
+    ]]] = ["conceptual"]
+
+class VideoFromScriptRequest(BaseModel):
+    script: dict
+    theme: Optional[str] = "algorithm"
+    prompt: Optional[str] = ""
+    video_type: Optional[str] = "short"
+    session_id: Optional[str] = ""
+    topic: Optional[str] = ""
+
+# Place these endpoints after app is defined
+def register_script_endpoints(app):
+    @app.post("/generate-script")
+    async def generate_script(request: ScriptRequest):
+        """
+        Generate and return only the AI-generated script (scene list) for a prompt.
+        Uses the new 'Modern Premium' flow: Scholar (Facts) + Director (Manim Script).
+        """
+        if not request.prompt or request.prompt.strip() == "":
+            raise HTTPException(status_code=400, detail="Please enter a topic to generate a video script.")
+        if not MANIM_AVAILABLE:
+            raise HTTPException(status_code=503, detail="Manim not available.")
+        
+        try:
+            from modern_pipeline import generate_modern_premium_script
+            script = await generate_modern_premium_script(request.prompt)
+            
+            # --- Inject scene_policy / semantic framing ---
+            try:
+                from scene_policy import decide_scene_type
+            except ImportError:
+                def decide_scene_type(scene, topic=None, scene_id=None):
+                    return scene.get('intent', 'explanation')
+            
+            topic = request.prompt
+            for i, scene in enumerate(script.get('scenes', [])):
+                scene_id = i + 1
+                # Map intent to scene_type if director didn't use scene_type
+                if 'scene_type' not in scene:
+                    scene['scene_type'] = decide_scene_type(scene, topic=topic, scene_id=scene_id)
+                
+                # Ensure headline exists (Director script has headline)
+                if 'headline' not in scene:
+                    scene['headline'] = scene.get('title', topic)
+
+            return script
+        except Exception as e:
+            print(f"❌ Modern script generation failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Script generation failed: {e}")
+
+    @app.post("/generate-script-with-images")
+    async def generate_script_with_images(request: ScriptWithImagesRequest):
+        """
+        Generate and return a script using user-uploaded images (for review/edit).
+        """
+        if not request.topic or request.topic.strip() == "":
+            raise HTTPException(status_code=400, detail="Please enter a topic to generate a video script.")
+        session = image_sessions.get(request.session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found. Upload images first.")
+        script = await generate_script_with_user_images(request.topic, session)
+        if not script:
+            raise HTTPException(status_code=500, detail="Failed to generate script with images.")
+        return script
+
+    @app.post("/generate-video-from-script")
+    async def generate_video_from_script(request: VideoFromScriptRequest):
+        """
+        Generate a video from a reviewed/edited script (scene list).
+        """
+        if not MANIM_AVAILABLE:
+            raise HTTPException(status_code=503, detail="Manim not available.")
+        try:
+            generator = ManimVideoGenerator(theme_name=request.theme)
+            video_path = await generator.generate_from_script(request.script)
+            video_filename = os.path.basename(video_path)
+            video_url = f"{BASE_URL}/videos/{video_filename}"
+            # Calculate actual duration from the scenes provided in the script
+            # In the modern pipeline, each scene has a 'duration' field
+            total_duration = sum(float(s.get('duration', 5.0)) for s in request.script.get('scenes', []))
+            
+            return {
+                "video_url": video_url,
+                "title": request.script.get('title', 'Untitled'),
+                "duration": total_duration,
+                "quality": "HIGH (Manim)",
+                "scenes": len(request.script.get('scenes', [])),
+                "theme": request.theme
+            }
+        except Exception as e:
+            print(f"   ❌ Manim rendering failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Video rendering failed: {e}")
+
+
+# Register endpoints after app is defined
+# (Move this to after the FastAPI app = FastAPI(...) definition)
 import json
+from semantic_scene_map import get_semantic_scene_type
 import uuid
 import os
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict
 from moviepy import (
     TextClip, 
     ColorClip, 
@@ -25,14 +157,79 @@ from dotenv import load_dotenv
 from PIL import Image
 from io import BytesIO
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🧠 SMART VIDEO ENGINE - Dynamic, Modern, Varied Frames
+# ═══════════════════════════════════════════════════════════════════════════════
+from semantic_framing import choose_layout, get_layout_zones, LayoutType
+from semantic_renderers import render_semantic_frame, RENDERERS
+
+# NEW: Smart video engine with dynamic styles
+from smart_video_engine import (
+    create_video_plan,
+    parse_ai_explanation,
+    VideoStyle,
+    generate_explanation_prompt,
+    KnowledgeUnit,
+    classify_meaning,
+    COLOR_PALETTES,
+)
+from modern_renderers import render_frame, render_all_scenes, FRAME_RENDERERS
+
+# NEW: Visual renderers with AI images, equations, flowcharts
+from visual_renderers import render_visual_frame, VISUAL_RENDERERS, get_palette_for_topic
+
+# NEW: Clean renderers (no external API, 100% reliable)
+from clean_renderers import render_clean_frame, RENDERERS as CLEAN_RENDERERS
+
+# NEW: AI-enhanced renderer with beautiful flowcharts
+from ai_image_renderer import render_ai_frame, RENDERERS as AI_RENDERERS
+
+# NEW: Themed renderer - code-based, 100% reliable, user-controlled themes
+from themed_renderer import render_themed_frame
+
+# NEW: Manim + MoviePy engine for HIGH QUALITY animations
+# This is the GOLD combo for educational content
+try:
+    from manim_engine import ManimVideoGenerator, THEMES as MANIM_THEMES
+    MANIM_AVAILABLE = True
+    print("✅ Manim engine loaded - HIGH QUALITY mode available!")
+except ImportError as e:
+    MANIM_AVAILABLE = False
+    print(f"⚠️ Manim not available: {e}")
+
+from style_reference_system import (
+    DEFAULT_THEMES,
+    get_current_theme,
+    set_current_theme,
+    load_theme,
+    list_available_themes,
+    get_theme_preview_colors,
+)
+
+
+# Flags to control which rendering system to use
+USE_MANIM = True           # NEW: Manim for professional animations (BEST QUALITY)
+USE_THEMED_RENDERER = False  # Code-based, consistent themes  
+USE_AI_RENDERER = False     # AI-enhanced with flowcharts
+USE_CLEAN_RENDERER = False  # Clean visuals with emojis
+USE_VISUAL_RENDERER = False # AI images (may hit rate limits)
+USE_SMART_ENGINE = False    # Disabled in favor of clean renderer
+USE_SEMANTIC_FRAMING = True
+USE_MOTION_CANVAS = False   # <--- Fix: define this flag
+
 # Load environment variables
 load_dotenv()
 
+BASE_URL = os.getenv("API_URL", "http://localhost:8000")
+
 # Get API key from environment or fallback to app_secrets
+
+# Always try to get API_KEY from app_secrets.py if not set in env
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 if not API_KEY:
     try:
-        from app_secrets import API_KEY
+        from app_secrets import API_KEY as SECRET_API_KEY
+        API_KEY = SECRET_API_KEY
     except ImportError:
         raise ValueError("OPENROUTER_API_KEY not found in environment or app_secrets.py")
 
@@ -45,19 +242,193 @@ if not OPENAI_API_KEY:
         OPENAI_API_KEY = None
         print("⚠️ OPENAI_API_KEY not found - will use Unsplash for images instead of DALL-E")
 
+# Google API Key for Imagen image generation
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "AIzaSyDtYX_1gdrVYP9i21K4jiSgnuOqpLYG7n8")
+
+
 # Create directories if they don't exist
-os.makedirs("backend/output", exist_ok=True)
-os.makedirs("backend/temp/audio", exist_ok=True)
-os.makedirs("backend/temp/images", exist_ok=True)
+os.makedirs("output", exist_ok=True)
+os.makedirs("temp/audio", exist_ok=True)
+os.makedirs("temp/images", exist_ok=True)
+
+# Serve videos for download/playback
+from fastapi.staticfiles import StaticFiles
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 🖼️ IMAGE GENERATION - Use OpenRouter API for AI image generation
+# 🖼️ IMAGE GENERATION - Pollinations.ai (FREE, no API key!) + Fallbacks
 # ══════════════════════════════════════════════════════════════════════════════
 
-def generate_image_openrouter(prompt: str) -> str:
-    """Generate an image using OpenRouter API (Gemini image models via chat completions)"""
+def generate_image_stable_diffusion(prompt: str, scene_type: str = "explanation") -> str:
+    """Generate an AI image using Pollinations.ai (FREE, no API key needed!)
+    
+    Following the SHORTS FRAMING BLUEPRINT:
+    - Icons only (sun, leaf, water, etc.)
+    - Clean, minimal, dark background
+    - NO text, NO arrows (those are added by code)
+    """
     try:
-        print(f"   🎨 Generating AI image: {prompt[:50]}...")
+        # Build icon-focused prompts based on scene type
+        scene_prompts = {
+            "title": f"Single bold iconic symbol representing {prompt}, centered, minimal flat design, dark background, vibrant accent color, no text, vector style icon",
+            "inputs": f"Simple flat icon of {prompt}, minimal design, dark background, bright color, no text, centered, clean vector illustration",
+            "process": f"Simple diagram icon showing {prompt}, flat design, dark background, glowing accent color, no text, minimal shapes",
+            "output": f"Result icon representing {prompt}, bright accent color, dark background, minimal flat design, no text",
+            "definition": f"Single bold icon representing {prompt}, centered, modern flat design, dark background, bright accent color, no text",
+            "explanation": f"Educational icon illustrating {prompt}, clean flat design, dark background, accent color glow, no text",
+            "example": f"Real-world icon of {prompt}, friendly cartoon style, dark background, bright colors, no text",
+            "flowchart": f"Simple flowchart diagram for {prompt}, flat design, dark background, cyan and white, no text",
+            "diagram": f"Scientific diagram of {prompt}, dark background, clean lines, accent colors, no text",
+            "formula": f"Mathematical concept icon for {prompt}, abstract geometric shapes, dark background, no text",
+            "array": f"Data boxes visualization for {prompt}, colorful numbered boxes, dark background, neon accents",
+            "summary": f"Checkmark success icon, green accent, dark background, minimal flat design, no text",
+            "comparison": f"Two contrasting icons side by side for {prompt}, versus style, dark background",
+            "timeline": f"Timeline marker icon for {prompt}, horizontal line with markers, dark background",
+            "fact": f"Big bold icon representing {prompt}, impressive scale, dark background, bright accent, no text",
+            "code": f"Code snippet icon representing {prompt}, dark background, clean flat design, bright accent color, no text",
+            "DSA": f"Data structure and algorithm icon for {prompt}, clean flat design, dark background, bright accent color, no text",
+            "SST": f"Superscalar architecture icon for {prompt}, modern flat design, dark background, vibrant accent color, no text",
+            "website": f"Website icon representing {prompt}, modern flat design, dark background, bright accent color, no text",
+            "visulaization": f"Data visualization icon for {prompt}, colorful shapes, dark background, bright accent colors, no text",
+            "maths": f"Mathematics icon for {prompt}, geometric shapes, dark background, bright accent colors, no text",
+            "diagram": f"Scientific diagram of {prompt}, dark background, clean lines, accent colors, no text",
+            "flowchart": f"Simple flowchart diagram for {prompt}, flat design, dark background, cyan and white, no text",
+            "list": f"Bullet points icon representing {prompt}, checklist style, dark background, bright accent colors, no text",
+            "tree": f"Tree data structure icon for {prompt}, clean flat design, dark background, bright accent colors, no text",
+            "linked list": f"Linked list data structure icon for {prompt}, clean flat design, dark background, bright accent colors, no text",
+            "graph": f"Graph data structure icon for {prompt}, nodes and edges, dark background, bright accent colors, no text",
+            "table": f"Data table icon for {prompt}, rows and columns, dark background, bright accent colors, no text",
+            "stack": f"Stack data structure icon for {prompt}, clean flat design, dark background, bright accent colors, no text",
+            "queue": f"Queue data structure icon for {prompt}, clean flat design, dark background, bright accent colors, no text",
+        }
+        
+        base_prompt = scene_prompts.get(scene_type, f"Clean minimal icon of {prompt}, flat design, dark background, accent color, no text")
+        style_suffix = ", high quality, professional icon design, digital art, dribbble style"
+        full_prompt = base_prompt + style_suffix
+        
+        print(f"   🎨 Pollinations AI [{scene_type}]: {prompt[:40]}...")
+        
+        # Use Pollinations.ai - FREE image generation with Stable Diffusion
+        # URL encode the prompt
+        import urllib.parse
+        encoded_prompt = urllib.parse.quote(full_prompt)
+        
+        # Pollinations API - completely free!
+        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=768&height=1024&model=flux&nologo=true"
+        
+        response = requests.get(url, timeout=120)
+        
+        if response.status_code == 200 and response.headers.get('content-type', '').startswith('image'):
+            img_path = f"temp/images/{uuid.uuid4()}.png"
+            with open(img_path, 'wb') as f:
+                f.write(response.content)
+            print(f"   ✅ Pollinations AI image saved: {img_path}")
+            return img_path
+        else:
+            error_msg = response.text[:200] if response.text else "Unknown error"
+            print(f"   ⚠️ Pollinations error ({response.status_code}): {error_msg[:50]}")
+    except Exception as e:
+        print(f"   ⚠️ Pollinations failed: {e}")
+    
+    return None
+
+def generate_image_google(prompt: str, scene_type: str = "explanation") -> str:
+    """Generate an AI image using Google Gemini 2.0 Flash with image generation"""
+    try:
+        # Build a detailed prompt based on scene type
+        scene_prompts = {
+            "flowchart": f"Educational flowchart diagram showing {prompt}. Clean boxes connected with arrows, minimal text labels, modern flat design style, dark navy background, white and cyan colored elements, professional infographic style",
+            "process": f"Step-by-step process infographic for {prompt}. Numbered circular steps with simple icons, connected by arrows, modern minimalist design, dark background with bright accent colors",
+            "comparison": f"Side-by-side comparison infographic of {prompt}. Two columns with icons and bullet points, versus layout, dark theme with contrasting colors, clean professional design",
+            "diagram": f"Educational labeled diagram of {prompt}. Clear labels with lines pointing to parts, clean vector style, dark background with bright accents, scientific illustration style",
+            "formula": f"Visual mathematical concept illustration for {prompt}. Abstract geometric shapes representing the concept, clean modern design, dark background with glowing accents",
+            "array": f"Data visualization showing {prompt}. Colorful boxes with numbers, arrows indicating movement, algorithm visualization style, dark background with neon accents",
+            "timeline": f"Horizontal timeline infographic about {prompt}. Events marked with icons on a line, clean modern design, dark theme with colorful markers",
+            "definition": f"Iconic symbol illustration representing {prompt}. Single bold icon or symbol, modern flat design, centered composition, dark background with bright colored accent",
+            "example": f"Real-world illustration of {prompt}. Friendly cartoon style scene, relatable everyday setting, bright cheerful colors, simple clean design",
+            "code": f"Code snippet icon representing {prompt}, dark background, clean flat design, bright accent color, no text",
+            "list": f"Bullet points icon representing {prompt}, checklist style, dark background, bright accent colors, no text",
+            "linked list": f"Linked list data structure icon for {prompt}, clean flat design, dark background, bright accent colors, no text",
+        }
+        
+        image_prompt = scene_prompts.get(scene_type, f"Clean educational illustration about {prompt}. Modern flat design, simple geometric shapes, dark background, vibrant accent colors, professional infographic style")
+        
+        print(f"   🎨 Google Gemini [{scene_type}]: {prompt[:40]}...")
+        
+        # Try Gemini 2.0 Flash (experimental image generation)
+        # This model can generate images when properly configured
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent?key={GOOGLE_API_KEY}"
+        
+        response = requests.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{
+                    "parts": [{
+                        "text": image_prompt
+                    }]
+                }],
+                "generationConfig": {
+                    "responseModalities": ["TEXT", "IMAGE"]
+                }
+            },
+            timeout=90
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            candidates = data.get("candidates", [])
+            if candidates:
+                content = candidates[0].get("content", {})
+                parts = content.get("parts", [])
+                for part in parts:
+                    if "inlineData" in part:
+                        import base64
+                        b64_data = part["inlineData"].get("data", "")
+                        mime_type = part["inlineData"].get("mimeType", "image/png")
+                        if b64_data:
+                            img_bytes = base64.b64decode(b64_data)
+                            ext = "png" if "png" in mime_type else "jpg"
+                            img_path = f"temp/images/{uuid.uuid4()}.{ext}"
+                            with open(img_path, 'wb') as f:
+                                f.write(img_bytes)
+                            print(f"   ✅ Google Gemini image saved: {img_path}")
+                            return img_path
+            print(f"   ⚠️ No image in Google Gemini response")
+        else:
+            error_msg = response.text[:300] if response.text else "Unknown error"
+            print(f"   ⚠️ Google Gemini error ({response.status_code}): {error_msg}")
+    except Exception as e:
+        print(f"   ⚠️ Google image generation failed: {e}")
+    
+    return None
+
+def generate_image_openrouter(prompt: str, scene_type: str = "explanation") -> str:
+    """Generate an AI image using OpenRouter API - creates topic-specific educational visuals"""
+    try:
+        # Build a detailed prompt based on scene type
+        if scene_type == "flowchart":
+            image_prompt = f"Create a clean flowchart diagram showing: {prompt}. Use boxes connected with arrows, minimal text, modern flat design, dark background (#121218), white and colored elements."
+        elif scene_type == "process":
+            image_prompt = f"Create a step-by-step process diagram for: {prompt}. Show numbered steps with icons, connected flow, modern minimalist style, dark background."
+        elif scene_type == "comparison":
+            image_prompt = f"Create a side-by-side comparison infographic for: {prompt}. Two columns, clean icons, versus layout, dark theme with accent colors."
+        elif scene_type == "diagram":
+            image_prompt = f"Create an educational diagram illustrating: {prompt}. Labeled parts, clean lines, modern flat design, dark background with bright accents."
+        elif scene_type == "formula":
+            image_prompt = f"Create a visual representation of the concept: {prompt}. Show the mathematical or logical relationship, clean modern design, dark background."
+        elif scene_type == "array":
+            image_prompt = f"Create a visualization of data/array showing: {prompt}. Boxes with numbers, arrows showing movement, algorithm visualization style, dark background."
+        elif scene_type == "timeline":
+            image_prompt = f"Create a timeline infographic for: {prompt}. Horizontal or vertical timeline with events marked, clean modern design, dark theme."
+        elif scene_type == "definition":
+            image_prompt = f"Create an iconic illustration representing: {prompt}. Single clear symbol or icon, modern flat design, centered, dark background with colored accent."
+        elif scene_type == "example":
+            image_prompt = f"Create a real-world illustration showing: {prompt}. Relatable everyday scene, cartoon style, bright colors on dark background."
+        
+        else:
+            image_prompt = f"Create a clean educational illustration for: {prompt}. Modern flat design, simple shapes, dark background (#121218), vibrant accent colors."
+        
+        print(f"   🎨 Generating AI image [{scene_type}]: {prompt[:40]}...")
         
         response = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -72,7 +443,7 @@ def generate_image_openrouter(prompt: str) -> str:
                 "messages": [
                     {
                         "role": "user",
-                        "content": f"Create a simple illustration: {prompt}"
+                        "content": image_prompt
                     }
                 ],
                 "max_tokens": 2000  # Limit tokens to stay within credit budget
@@ -114,7 +485,7 @@ def generate_image_openrouter(prompt: str) -> str:
                             # Regular URL - download it
                             img_response = requests.get(image_url, timeout=30)
                             if img_response.status_code == 200:
-                                img_path = f"backend/temp/images/{uuid.uuid4()}.png"
+                                img_path = f"temp/images/{uuid.uuid4()}.png"
                                 with open(img_path, 'wb') as f:
                                     f.write(img_response.content)
                                 print(f"   ✅ AI image saved: {img_path}")
@@ -159,7 +530,7 @@ def generate_dalle_image(prompt: str, size: str = "1024x1024") -> str:
             
             img_response = requests.get(image_url, timeout=30)
             if img_response.status_code == 200:
-                img_path = f"backend/temp/images/{uuid.uuid4()}.png"
+                img_path = f"temp/images/{uuid.uuid4()}.png"
                 with open(img_path, 'wb') as f:
                     f.write(img_response.content)
                 print(f"   ✅ DALL-E image saved")
@@ -171,42 +542,149 @@ def generate_dalle_image(prompt: str, size: str = "1024x1024") -> str:
     
     return None
 
-def fetch_stock_image(query: str, width: int = 600, height: int = 400) -> str:
-    """Fetch stock image from Unsplash (free fallback)"""
+def fetch_stock_image(query: str, width: int = 600, height: int = 400, scene_type: str = "explanation") -> str:
+    """Fetch TOPIC-SPECIFIC stock image from multiple free sources"""
+    
+    # Clean and enhance query based on scene type
+    search_query = query.lower().strip()
+    
+    # Add visual keywords based on scene type to get better results
+    scene_keywords = {
+        "flowchart": "diagram process chart",
+        "process": "steps workflow",
+        "comparison": "versus comparison",
+        "diagram": "illustration infographic",
+        "formula": "mathematics science",
+        "array": "data numbers technology",
+        "timeline": "history timeline events",
+        "definition": "concept icon symbol",
+        "example": "real world practical",
+        "explanation": "educational learning"
+    }
+    extra_keywords = scene_keywords.get(scene_type, "")
+    enhanced_query = f"{search_query} {extra_keywords}".strip()
+    
+    # Source 1: Pexels API (FREE with topic search!)
     try:
-        print(f"   📷 Fetching stock image: {query[:40]}...")
-        clean_query = query.replace(" ", ",").lower()[:50]
+        print(f"   📷 Trying Pexels: {enhanced_query[:40]}...")
+        # Pexels offers free API with 200 req/hour
+        pexels_url = f"https://api.pexels.com/v1/search?query={enhanced_query}&per_page=5&orientation=portrait"
+        headers = {
+            "Authorization": "9c5qmFOsJKd32VCCi4cYODBnRdJUqjSCW8pYdVlMxYeMaG9aUOKMXiKc"  # Free API key
+        }
+        response = requests.get(pexels_url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            photos = data.get("photos", [])
+            if photos:
+                # Pick random from top results for variety
+                photo = random.choice(photos[:min(3, len(photos))])
+                img_url = photo.get("src", {}).get("large", photo.get("src", {}).get("medium"))
+                if img_url:
+                    img_response = requests.get(img_url, timeout=15)
+                    if img_response.status_code == 200 and len(img_response.content) > 5000:
+                        img_path = f"temp/images/{uuid.uuid4()}.jpg"
+                        with open(img_path, 'wb') as f:
+                            f.write(img_response.content)
+                        print(f"   ✅ Pexels image saved (topic: {search_query[:20]})")
+                        return img_path
+    except Exception as e:
+        print(f"   ⚠️ Pexels failed: {e}")
+    
+    # Source 2: Pixabay API (FREE with topic search!)
+    try:
+        print(f"   📷 Trying Pixabay: {enhanced_query[:40]}...")
+        # Pixabay free API
+        pixabay_key = "50788160-c48f6f81f44f9ac66ac6b5e70"  # Free API key
+        pixabay_url = f"https://pixabay.com/api/?key={pixabay_key}&q={enhanced_query.replace(' ', '+')}&image_type=illustration&per_page=5"
+        response = requests.get(pixabay_url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            hits = data.get("hits", [])
+            if hits:
+                hit = random.choice(hits[:min(3, len(hits))])
+                img_url = hit.get("webformatURL") or hit.get("largeImageURL")
+                if img_url:
+                    img_response = requests.get(img_url, timeout=15)
+                    if img_response.status_code == 200 and len(img_response.content) > 3000:
+                        img_path = f"temp/images/{uuid.uuid4()}.jpg"
+                        with open(img_path, 'wb') as f:
+                            f_write = img_response.content
+                            f.write(f_write)
+                        print(f"   ✅ Pixabay image saved (topic: {search_query[:20]})")
+                        return img_path
+    except Exception as e:
+        print(f"   ⚠️ Pixabay failed: {e}")
+    
+    # Source 3: Unsplash (topic-based, may have rate limits)
+    try:
+        print(f"   📷 Trying Unsplash: {enhanced_query[:40]}...")
+        clean_query = enhanced_query.replace(" ", ",").lower()[:50]
         image_url = f"https://source.unsplash.com/{width}x{height}/?{clean_query}"
         
         response = requests.get(image_url, timeout=10, allow_redirects=True)
         if response.status_code == 200 and len(response.content) > 1000:
-            img_path = f"backend/temp/images/{uuid.uuid4()}.jpg"
+            img_path = f"temp/images/{uuid.uuid4()}.jpg"
             with open(img_path, 'wb') as f:
                 f.write(response.content)
-            print(f"   ✅ Stock image saved")
+            print(f"   ✅ Unsplash image saved (topic: {search_query[:20]})")
             return img_path
     except Exception as e:
-        print(f"   ⚠️ Stock image failed: {e}")
+        print(f"   ⚠️ Unsplash failed: {e}")
+    
+    # Source 4: Placeholder with topic text (always works)
+    try:
+        print(f"   📷 Using placeholder...")
+        # Create placeholder with the actual topic name
+        topic_short = query[:15].replace(" ", "+")
+        response = requests.get(f"https://placehold.co/{width}x{height}/1a1a2e/ffffff?text={topic_short}", timeout=10)
+        if response.status_code == 200 and len(response.content) > 500:
+            img_path = f"temp/images/{uuid.uuid4()}.png"
+            with open(img_path, 'wb') as f:
+                f.write(response.content)
+            print(f"   ✅ Placeholder image saved")
+            return img_path
+    except Exception as e:
+        print(f"   ⚠️ Placeholder failed: {e}")
     
     return None
 
-def fetch_image_for_topic(query: str, width: int = 600, height: int = 400, use_ai: bool = True) -> str:
-    """Fetch image - tries OpenRouter AI first, then DALL-E, then stock images"""
+def fetch_image_for_topic(query: str, width: int = 600, height: int = 400, use_ai: bool = True, scene_type: str = "explanation") -> str:
+    """Fetch image following the SHORTS FRAMING BLUEPRINT
     
-    # 1. Try OpenRouter image generation (uses same API key as text)
+    Priority order:
+    1. Stable Diffusion via Hugging Face (FREE!)
+    2. Google Gemini (fallback)
+    3. OpenRouter (fallback)  
+    4. Stock images (final fallback)
+    """
+    
+    # 1. Try Stable Diffusion via Hugging Face (FREE - best for clean icons)
     if use_ai:
-        ai_path = generate_image_openrouter(query)
+        sd_path = generate_image_stable_diffusion(query, scene_type)
+        if sd_path:
+            return sd_path
+    
+    # 2. Try Google Gemini (fallback)
+    if use_ai and GOOGLE_API_KEY:
+        google_path = generate_image_google(query, scene_type)
+        if google_path:
+            return google_path
+    
+    # 3. Try OpenRouter image generation (fallback)
+    if use_ai:
+        ai_path = generate_image_openrouter(query, scene_type)
         if ai_path:
             return ai_path
     
-    # 2. Try DALL-E if OpenAI key available
+    # 4. Try DALL-E if OpenAI key available
     if OPENAI_API_KEY:
         dalle_path = generate_dalle_image(query, "1024x1024")
         if dalle_path:
             return dalle_path
     
-    # 3. Fallback to stock images
-    stock_path = fetch_stock_image(query, width, height)
+    # 5. Fallback to stock images
+    stock_path = fetch_stock_image(query, width, height, scene_type)
     if stock_path:
         return stock_path
     
@@ -226,43 +704,56 @@ def create_image_clip(image_path: str, target_width: int, target_height: int, du
     return None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 🎨 MINIMALIST YOUTUBE SHORTS STYLE - Dark, Bold, Geometric
+# � YOUTUBE SHORTS FRAMING BLUEPRINT
 # ══════════════════════════════════════════════════════════════════════════════
-# Style: Dark background, bold white text, geometric shapes, high contrast accents
+# Format: 1080 × 1920 (vertical)
+# Background: Dark (#0E0E0E)
+# Rule: ONE frame = ONE idea
+#
+# UNIVERSAL FRAME LAYOUT:
+# ┌──────────────────────────┐
+# │        HEADLINE          │  ← Big, bold (top 20%)
+# │──────────────────────────│
+# │                          │
+# │     VISUAL ZONE          │  ← Icons / shapes / arrows (middle 60%)
+# │                          │
+# │──────────────────────────│
+# │     SUPPORT TEXT         │  ← Small, optional (bottom 20%)
+# └──────────────────────────┘
 
 # Scene Type → Frame Style mapping (UNIVERSAL - works for any topic)
 FRAME_STYLES = {
-    # Basic frames
-    "title": "title_frame",         # 🎬 Big bold title
+    # Basic frames (per blueprint)
+    "title": "title_frame",         # 🎬 HOOK - Grab attention in 1 second
     "intro": "title_frame",         # 🎬 Same as title
     "outro": "title_frame",         # 🎬 End frame
-    "summary": "summary_frame",     # ✅ Checkmarks, key points
+    "inputs": "inputs_frame",       # ⬇️ INPUTS - What goes in (ingredients)
+    "process": "process_frame",     # ⚙️ PROCESS - Core explanation (HOW)
+    "output": "output_frame",       # ⬆️ OUTPUT - Result / what comes out
+    "summary": "summary_frame",     # ✅ SUMMARY - Memory lock (checkmarks)
     
     # Content frames
     "definition": "definition_frame",  # 📖 Define a term
     "explanation": "explanation_frame", # 💡 Explain a concept
     "example": "example_frame",        # 📌 Show an example
-    "fact": "fact_frame",              # � Big number/statistic
+    "fact": "fact_frame",              # 🔢 Big number/statistic
     
     # Structured content
     "list": "list_frame",           # 📋 Bullet points
-    "process": "process_frame",     # ⚙️ Steps with arrows
     "comparison": "comparison_frame", # ⚖️ Side-by-side comparison
-    "timeline": "timeline_frame",   # � Timeline events
-    "formula": "formula_frame",     # � Math formula
+    "timeline": "timeline_frame",   # 📅 Timeline events
+    "formula": "formula_frame",     # 🧮 Math formula
     "diagram": "diagram_frame",     # 📊 Simple diagram
     "flowchart": "flowchart_frame", # 🔀 Flowchart with nodes
     "array": "array_frame",         # 📊 Array visualization
     "table": "table_frame",         # 📋 Data table
     
     # Legacy/fallback
-    "inputs": "list_frame",
-    "output": "fact_frame",
     "step": "process_frame",
-    "result": "fact_frame",
+    "result": "output_frame",
 }
 
-# Accent colors for variety (high contrast on dark bg)
+# Accent colors for variety (per blueprint - ONE per frame)
 ACCENT_COLORS = [
     (0, 255, 136),    # Neon Green
     (255, 107, 107),  # Coral Red
@@ -272,10 +763,29 @@ ACCENT_COLORS = [
     (255, 159, 67),   # Orange
 ]
 
-# Dark background color
-DARK_BG = (18, 18, 24)  # Near black with slight blue
+# Dark background color (per blueprint: #0E0E0E)
+DARK_BG = (14, 14, 14)  # #0E0E0E - true dark as per blueprint
+
+# Frame layout zones (percentage of 1920 height)
+ZONE_HEADLINE = 0.15      # Top 15% for headline
+ZONE_VISUAL_START = 0.18  # Visual zone starts at 18%
+ZONE_VISUAL_END = 0.70    # Visual zone ends at 70%
+ZONE_SUPPORT = 0.75       # Support text starts at 75%
 
 # Helper functions for text handling
+def infer_theme_from_topic(topic: str) -> str:
+    """Guess the best visual theme based on the topic keywords."""
+    t = topic.lower()
+    if any(k in t for k in ["war", "empire", "history", "century", "king", "revolution", "civics", "law", "government"]):
+        return "retro"
+    if any(k in t for k in ["math", "formula", "logic", "proof", "number", "geometry"]):
+        return "maths"
+    if any(k in t for k in ["bio", "science", "physics", "chem", "atom", "dna", "space", "planet", "bmi", "health", "body", "muscle", "calorie", "disease", "medical", "anatomy", "biology"]):
+        return "science"
+    if any(k in t for k in ["digital", "ai", "robo", "future", "cyber"]):
+        return "neon"
+    return None
+
 def wrap_text(text, max_chars=25):
     """Wrap text to fit within boxes - prevents overflow"""
     if not text:
@@ -329,10 +839,10 @@ def log_header(title):
     print(f"  {title}")
     log_separator()
 
-app = FastAPI(title="Aetheris API")
 
-# Mount output directory to serve video files
-app.mount("/output", StaticFiles(directory="backend/output"), name="output")
+app = FastAPI(title="Aetheris API")
+# Mount /videos for video playback and download
+app.mount("/videos", StaticFiles(directory="output"), name="videos")
 
 app.add_middleware(
     CORSMiddleware,
@@ -355,6 +865,376 @@ class VideoResponse(BaseModel):
 @app.get("/")
 async def root():
     return {"message": "Welcome to Aetheris - AI Video System"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🎨 THEME MANAGEMENT ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/themes")
+async def get_themes():
+    """Get all available themes with preview colors."""
+    themes = list_available_themes()
+    return {
+        "themes": themes,
+        "current": get_current_theme().get('name', 'algorithm_explainer'),
+        "message": "Available themes for video generation"
+    }
+
+class ThemeRequest(BaseModel):
+    theme_name: str
+
+@app.post("/themes/select")
+async def select_theme(request: ThemeRequest):
+    """Select a theme for video generation."""
+    theme_name = request.theme_name
+    if theme_name in DEFAULT_THEMES:
+        set_current_theme(theme_name)
+        theme = get_current_theme()
+        return {
+            "success": True,
+            "theme": theme_name,
+            "colors": theme.get('colors', {}),
+            "message": f"Theme '{theme_name}' selected successfully"
+        }
+    else:
+        available = list(DEFAULT_THEMES.keys())
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Theme '{theme_name}' not found. Available: {available}"
+        )
+
+@app.get("/themes/current")
+async def get_current_theme_info():
+    """Get the current theme details."""
+    theme = get_current_theme()
+    return {
+        "name": theme.get('name', 'algorithm_explainer'),
+        "colors": theme.get('colors', {}),
+        "style": theme.get('style', {}),
+        "description": theme.get('description', 'Default theme')
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📸 USER IMAGE UPLOAD SYSTEM
+# ═══════════════════════════════════════════════════════════════════════════════
+from fastapi import UploadFile, File, Form
+from user_image_system import (
+    ImageSession, 
+    analyze_all_images, 
+    generate_script_with_user_images,
+    render_user_image_array
+)
+
+# Store active sessions
+image_sessions: Dict[str, ImageSession] = {}
+
+@app.post("/upload-images")
+async def upload_images(files: List[UploadFile] = File(...)):
+    """
+    Upload 4-8 images for video generation.
+    AI will analyze each image and use them in the video.
+    
+    Returns session_id to use with /generate-video-with-images
+    """
+    if len(files) < 2:
+        raise HTTPException(status_code=400, detail="Please upload at least 2 images")
+    if len(files) > 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 images allowed")
+    
+    # Create new session
+    session = ImageSession()
+    
+    print(f"\n📸 New image session: {session.session_id}")
+    print(f"   Uploading {len(files)} images...")
+    
+    for file in files:
+        content = await file.read()
+        session.add_image(content, file.filename)
+    
+    # Analyze all images with AI
+    await analyze_all_images(session)
+    
+    # Store session
+    image_sessions[session.session_id] = session
+    
+    # Return session info
+    return {
+        "session_id": session.session_id,
+        "images": [
+            {
+                "index": img["index"],
+                "filename": img["filename"],
+                "analysis": img.get("analysis", {})
+            }
+            for img in session.images
+        ],
+        "message": f"Uploaded {len(files)} images. Use session_id with /generate-video-with-images"
+    }
+
+
+class ImageVideoRequest(BaseModel):
+    session_id: str
+    topic: str
+    video_type: Optional[str] = "short"
+
+@app.post("/generate-video-with-images")
+async def generate_video_with_images(request: ImageVideoRequest):
+    """
+    Generate a video using previously uploaded images.
+    
+    The AI will:
+    1. Use your images as visual examples
+    2. Generate script referencing YOUR images
+    3. Show your images being sorted/moved/compared
+    """
+    session = image_sessions.get(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found. Upload images first.")
+    
+    if len(session.images) < 2:
+        raise HTTPException(status_code=400, detail="Session has less than 2 images")
+    
+    print(f"\n🎬 Generating video with user images")
+    print(f"   Session: {request.session_id}")
+    print(f"   Topic: {request.topic}")
+    print(f"   Images: {len(session.images)}")
+    
+    # Generate script using user's images
+    script = await generate_script_with_user_images(request.topic, session)
+    
+    if not script:
+        raise HTTPException(status_code=500, detail="Failed to generate script")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 🎬 VIDEO RENDERING PIPELINE
+    # ═══════════════════════════════════════════════════════════════
+    
+    video_id = str(uuid.uuid4())
+    clips = []
+    total_duration = 0
+    total_duration_motion_canvas = 0
+    
+    # Video settings
+    voice = "en-US-ChristopherNeural"
+    width, height = (1080, 1920) if request.video_type == "short" else (1920, 1080)
+    
+    print(f"\n🚀 Rendering {len(script['scenes'])} scenes...")
+    
+    try:
+        for i, scene in enumerate(script['scenes']):
+            print(f"   🎬 Scene {i+1}: {scene.get('scene_type', 'unknown')}")
+            
+            # 1. Generate Audio
+            audio_path = f"temp/audio/{video_id}_{i}.mp3"
+            narration_text = scene.get('narration', '')
+            
+            try:
+                communicate = edge_tts.Communicate(narration_text, voice)
+                await communicate.save(audio_path)
+            except Exception as e:
+                print(f"   ⚠️ Edge TTS failed: {e}")
+                tts = gTTS(text=narration_text, lang='en')
+                tts.save(audio_path)
+            
+            audio_clip = AudioFileClip(audio_path)
+            duration = audio_clip.duration + 0.5  # Add small pause
+            scene['duration'] = duration  # Update scene duration
+            
+            # 2. Render Visuals
+            scene_type = scene.get('scene_type', 'explanation').lower()
+            
+            # CHECK: Does this scene use user images?
+            user_indices = scene.get('user_images_shown', [])
+            
+            if user_indices:
+                print(f"     📸 Using {len(user_indices)} user images")
+                
+                # Use User Image Renderer
+                visual_clip = render_user_image_array(
+                    session=session,
+                    image_indices=user_indices,
+                    width=width,
+                    height=height,
+                    duration=duration,
+                    highlight_index=scene.get('highlight_index', -1),
+                    show_values=True,
+                    show_swap_animation="swap" in narration_text.lower()
+                )
+                
+                # Add headline overlay
+                headline = scene.get('headline', '')
+                if headline:
+                    txt_clip = TextClip(
+                        text=headline,
+                        font_size=80,
+                        color='white',
+                        font="/System/Library/Fonts/Helvetica.ttc",
+                        stroke_color='black',
+                        stroke_width=2
+                    ).with_duration(duration)
+                    txt_clip = txt_clip.with_position(('center', 150))
+                    visual_clip = CompositeVideoClip([visual_clip, txt_clip])
+                    
+            else:
+                # Use Standard Themed Renderer for other scenes
+                print(f"     🎨 Using themed renderer")
+                
+                # Ensure theme is loaded
+                if not get_current_theme():
+                    set_current_theme('algorithm_explainer')
+                
+                # Add required fields for themed renderer
+                scene['narration'] = narration_text
+                
+                visual_clip = render_themed_frame(
+                    scene=scene,
+                    width=width,
+                    height=height,
+                    topic=request.topic
+                )
+            
+            # Combine with audio
+            final_clip = visual_clip.with_audio(audio_clip)
+            clips.append(final_clip)
+            total_duration += duration
+            
+        # 3. Concatenate and Write Video
+        print(f"\n💾 Saving video ({total_duration:.1f}s)...")
+        final_video = concatenate_videoclips(clips)
+        
+        output_filename = f"{video_id}.mp4"
+        output_path = f"output/{output_filename}"
+        
+        # Write video file
+        final_video.write_videofile(
+            output_path,
+            fps=24,
+            codec="libx264",
+            audio_codec="aac",
+            threads=4,
+            logger="bar",
+            preset="ultrafast"
+        )
+        
+        print(f"✅ Video generated: {output_path}")
+        
+        return {
+            "video_url": f"http://localhost:8000/output/{output_filename}",
+            "title": script.get('title', request.topic),
+            "duration": total_duration
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Rendering failed: {str(e)}")
+
+
+@app.get("/sessions/{session_id}")
+async def get_session_info(session_id: str):
+    """Get info about an image upload session."""
+    session = image_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    return {
+        "session_id": session.session_id,
+        "num_images": len(session.images),
+        "images": [
+            {
+                "index": img["index"],
+                "filename": img["filename"],
+                "analysis": img.get("analysis", {})
+            }
+            for img in session.images
+        ]
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🎬 MANIM HIGH-QUALITY VIDEO GENERATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ManimVideoRequest(BaseModel):
+    prompt: str
+    theme: Optional[str] = "algorithm"
+    video_type: Optional[str] = "short"
+
+@app.post("/generate-video-hq")
+async def generate_video_high_quality(request: ManimVideoRequest):
+    """
+    Generate HIGH QUALITY video using Manim + MoviePy + Edge-TTS.
+    
+    This is the GOLD combo for educational YouTube content:
+    - Manim: Professional mathematical/DSA animations/scenes/science/GENERAL scenes/classroom visuals
+    - MoviePy: Merge voice + scenes
+    - Edge-TTS: Natural voice synthesis
+    
+    Perfect for: DSA, Algorithms, Math, CS concepts/science topics/boards students info like sst gk hindi english explation.
+    2-3 minutes of content with detailed explanations and smooth animations.
+    40-50 seconds for short explainer videos.
+    """
+    if not MANIM_AVAILABLE:
+        raise HTTPException(
+            status_code=503, 
+            detail="Manim not available. Install with: pip install manim"
+        )
+    
+    # Semantic Theme Choice: Change the theme automatically if the user topic matches a domain
+    inferred = infer_theme_from_topic(request.prompt)
+    if inferred and request.theme == 'algorithm':
+        print(f"   💡 Topic matches '{inferred}' domain. Switching theme...")
+        request.theme = inferred
+
+    print(f"\n🎬 HIGH QUALITY VIDEO GENERATED (Manim - Deep Analysis Mode)")
+    print(f"   Topic: {request.prompt}")
+    print(f"   Theme: {request.theme}")
+    
+    try:
+        from modern_pipeline import generate_modern_premium_script
+        from manim_engine import THEMES, DEFAULT_THEME, ManimVideoGenerator
+        
+        # This function now performs: Research -> Structural Planning -> One-by-One Frame Design
+        script = await generate_modern_premium_script(request.prompt)
+        
+        # Inject theme-specific colors into the script if not present
+        if 'bg_color' not in script:
+            theme_obj = THEMES.get(request.theme, DEFAULT_THEME)
+            script['bg_color'] = theme_obj.bg_color
+
+        print(f"   ✅ Ultra-Detail Script generated: {len(script.get('scenes', []))} frames designed one-by-one.")
+        
+    except Exception as e:
+        print(f"❌ Modern premium script generation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Deep analysis script generation failed: {e}")
+    
+    # Generate video with Manim using Parallel Depth Rendering
+    try:
+        generator = ManimVideoGenerator(theme_name=request.theme)
+        # Use generate_from_script for parallel, high-quality rendering of each designed frame
+        video_path = await generator.generate_from_script(script)
+        
+        # Get video URL
+        video_filename = os.path.basename(video_path)
+        video_url = f"{BASE_URL}/videos/{video_filename}"
+
+        
+        return {
+            "video_url": video_url,
+            "title": script.get('title', request.prompt),
+            "script": script, # Return the full script for the frontend player
+            "duration": sum(5 for _ in script.get('scenes', [])),  # Estimate
+            "quality": "HIGH (Manim)",
+            "scenes": len(script.get('scenes', [])),
+            "theme": request.theme
+        }
+        
+    except Exception as e:
+        print(f"   ❌ Manim rendering failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Video rendering failed: {e}")
+
 
 @app.post("/generate-video", response_model=VideoResponse)
 async def generate_video(request: PromptRequest):
@@ -471,36 +1351,6 @@ For TABLE scenes, provide:
 
 ═══════════════════════════════════════════════════════════════════════
 
-💡 TEACHING TIP:
-Think about what a GREAT teacher would draw on a whiteboard!
-- Teaching sorting? Draw the array with numbers moving!
-- Teaching a formula? Show what each symbol means!
-- Teaching a process? Draw the flow with arrows!
-- Comparing things? Show them side by side!
-
-The VISUAL should make the concept CLICK instantly. 
-Choose whatever visualization BEST explains the concept.
-
-═══════════════════════════════════════════════════════════════════════
-
-📋 OUTPUT FORMAT:
-{{
-  "title": "Catchy Title (5 words max)",
-  "vibe": "funny" | "dramatic" | "mind-blowing" | "chill",
-  "scenes": [
-    {{
-      "scene_type": "title|definition|explanation|process|flowchart|fact|example|diagram|formula|comparison|array|table|summary",
-      "headline": "2-4 WORDS MAX",
-      "narration": "Spoken text - casual, engaging, human",
-      "icon": "relevant emoji",
-      "accent_color": "green|red|teal|yellow|purple|orange",
-      // + scene-specific fields from above
-    }}
-  ]
-}}
-
-═══════════════════════════════════════════════════════════════════════
-
 🔥 EXAMPLE for "How WiFi Works":
 
 {{
@@ -568,8 +1418,15 @@ CRITICAL RULES:
     
     user_message = f"Topic: {request.prompt}. Audience: {request.target_audience}."
 
+    # Models to try (first paid, then free fallbacks)
+    MODELS_TO_TRY = [
+        "google/gemini-2.0-flash-001",      # Fast, cheap
+        "mistralai/devstral-2512:free",     # Free fallback
+        "nvidia/nemotron-3-nano-30b-a3b:free", # Free fallback
+    ]
+
     payload = {
-        "model": "google/gemini-2.0-flash-001",
+        "model": MODELS_TO_TRY[0],  # Start with primary
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
@@ -590,17 +1447,45 @@ CRITICAL RULES:
     log_separator("─")
 
     async with httpx.AsyncClient(timeout=120.0) as client:
+        script_data = None
+        last_error = None
+        
+        # Try each model until one works
+        for model_name in MODELS_TO_TRY:
+            try:
+                print(f"   🤖 Trying model: {model_name}")
+                payload["model"] = model_name
+                
+                response = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=payload
+                )
+                response.raise_for_status()
+                result = response.json()
+                script_data = json.loads(result['choices'][0]['message']['content'])
+                if isinstance(script_data, list) and len(script_data) > 0:
+                    script_data = script_data[0]
+                print(f"   ✅ Success with: {model_name}")
+                break  # Success! Exit loop
+                
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                if e.response.status_code == 402:
+                    print(f"   ⚠️ {model_name}: Out of credits, trying next...")
+                    continue
+                else:
+                    print(f"   ⚠️ {model_name}: HTTP {e.response.status_code}")
+                    continue
+            except Exception as e:
+                last_error = e
+                print(f"   ⚠️ {model_name}: {str(e)[:50]}")
+                continue
+        
+        if script_data is None:
+            raise HTTPException(status_code=500, detail=f"All models failed: {last_error}")
+        
         try:
-            response = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json=payload
-            )
-            response.raise_for_status()
-            result = response.json()
-            script_data = json.loads(result['choices'][0]['message']['content'])
-            if isinstance(script_data, list) and len(script_data) > 0:
-                script_data = script_data[0]
             
             # ══════════════════════════════════════════════════════════════════
             # 📥 LOG: AI RESPONSE RECEIVED
@@ -618,8 +1503,33 @@ CRITICAL RULES:
                 print(f"   Scene {idx+1}: [{stype.upper()}] → {FRAME_DESCRIPTIONS.get(frame_style, frame_style)}")
             log_separator("─")
             
+
+            # --- INTENT-BASED SCENE SELECTION PIPELINE ---
+            try:
+                from scene_policy import decide_scene_type
+            except ImportError:
+                def decide_scene_type(scene, topic=None, scene_id=None):
+                    return scene.get('type', 'explanation')
+
+            topic = script_data.get('title', request.prompt).lower().strip()
+            if 'scenes' in script_data:
+                for idx, scene in enumerate(script_data['scenes']):
+                    scene_id = idx + 1
+                    # 1. Semantic map override (CRITICAL)
+                    override = get_semantic_scene_type(topic, scene_id)
+                    if override:
+                        scene['scene_type'] = override
+                        continue
+                    # 2. Intent-based dynamic selection
+                    scene['scene_type'] = decide_scene_type(scene, topic=topic, scene_id=scene_id)
+                    # 3. Fallback: never allow ai: 0/null/filler
+                    if not scene['scene_type'] or scene['scene_type'] in [None, '', 'null', 0, 'ai:0', 'filler']:
+                        scene['scene_type'] = 'concept_flow_scene'
+
             video_id = str(uuid.uuid4())
             clips = []
+            processed_scenes = [] # For Motion Canvas
+            audio_clips_list = [] # For Motion Canvas
             total_duration = 0
             
             # Voice options for more human-like sound
@@ -627,9 +1537,11 @@ CRITICAL RULES:
             # Female: en-US-JennyNeural, en-US-AriaNeural
             voice = "en-US-ChristopherNeural"  # Natural male voice
             
+            total_duration_motion_canvas = 0
+            
             for i, scene in enumerate(script_data['scenes']):
                 # 1. Generate Audio with Edge TTS (more human-like)
-                audio_path = f"backend/temp/audio/{video_id}_{i}.mp3"
+                audio_path = f"temp/audio/{video_id}_{i}.mp3"
                 narration_text = scene.get('narration', '')
                 
                 try:
@@ -648,17 +1560,30 @@ CRITICAL RULES:
                 # Canvas size (9:16 for shorts, 16:9 for long)
                 width, height = (1080, 1920) if request.video_type == "short" else (1920, 1080)
                 
-                # Determine Frame Style based on Scene Type
+                # ═══════════════════════════════════════════════════════════════
+                # 🧠 SEMANTIC FRAMING: Auto-detect the best layout for content
+                # ═══════════════════════════════════════════════════════════════
                 scene_type = scene.get('scene_type', 'explanation').lower()
-                frame_style = FRAME_STYLES.get(scene_type, 'concept_frame')
+                headline = scene.get('headline', scene.get('narration', 'TOPIC')[:30].upper())
+                
+                if USE_SEMANTIC_FRAMING:
+                    # Let the semantic classifier choose the best layout
+                    semantic_layout = choose_layout(
+                        text=narration_text,
+                        headline=headline,
+                        scene_data=scene
+                    )
+                    frame_style = semantic_layout  # Use semantic layout type
+                    print(f"   🧠 SEMANTIC LAYOUT DETECTED: {semantic_layout.upper()}")
+                else:
+                    # Use original scene_type → frame_style mapping
+                    frame_style = FRAME_STYLES.get(scene_type, 'concept_frame')
                 
                 # Get accent color from scene or pick random
                 accent_name = scene.get('accent_color', 'green').lower()
                 accent_map = {'green': 0, 'red': 1, 'teal': 2, 'yellow': 3, 'purple': 4, 'orange': 5}
                 accent_color = ACCENT_COLORS[accent_map.get(accent_name, random.randint(0, 5))]
                 
-                # Get headline (fallback to narration excerpt)
-                headline = scene.get('headline', scene.get('narration', 'TOPIC')[:30].upper())
                 visual_elements = scene.get('visual_elements', [])
                 
                 # ══════════════════════════════════════════════════════════════
@@ -666,21 +1591,190 @@ CRITICAL RULES:
                 # ══════════════════════════════════════════════════════════════
                 print(f"\n🎬 RENDERING SCENE {i+1}/{len(script_data['scenes'])}")
                 print(f"   📌 Scene Type: {scene_type.upper()}")
-                print(f"   🎨 Frame Style: {FRAME_DESCRIPTIONS.get(frame_style, frame_style)}")
-                print(f"   � Headline: {headline}")
+                print(f"   🎨 Frame Style: {frame_style.upper()}")
+                print(f"   📝 Headline: {headline}")
                 print(f"   🎨 Accent Color: {accent_name}")
                 print(f"   ⏱️  Duration: {duration:.1f}s")
-                print(f"   �️  Narration: \"{scene.get('narration', '')[:60]}...\"")
+                print(f"   🗣️  Narration: \"{scene.get('narration', '')[:60]}...\"")
                 print(f"   🔷 Visual Elements: {visual_elements}")
 
-                layers = []
-                
+                # Store data for Motion Canvas
+                processed_scenes.append({
+                    **scene,
+                    'duration': duration,
+                    'scene_type': scene_type,
+                    'headline': headline,
+                    'narration': narration_text
+                })
+                audio_clips_list.append(audio_clip)
+
+                if USE_MOTION_CANVAS:
+                    total_duration_motion_canvas += duration
+                    # No longer skipping standard rendering, so we get an MP4 AND a Motion Canvas preview
+
                 # ═══════════════════════════════════════════════════════════════
-                # 🎨 MINIMALIST YOUTUBE SHORTS STYLE RENDERING
+                # 🎨 DARK BACKGROUND (base for all frames)
                 # ═══════════════════════════════════════════════════════════════
-                
-                # DARK BACKGROUND (base for all frames)
                 bg_clip = ColorClip(size=(width, height), color=DARK_BG, duration=duration)
+                
+                # ═══════════════════════════════════════════════════════════════
+                # � THEMED RENDERER (Code-based, 100% reliable, user themes)
+                # ═══════════════════════════════════════════════════════════════
+                if USE_THEMED_RENDERER:
+                    print(f"   🎨 Using THEMED RENDERER (scene_type={scene_type})")
+                    
+                    # Build scene with all necessary data
+                    themed_scene = {
+                        **scene,
+                        'scene_type': scene_type,
+                        'headline': headline,
+                        'narration': narration_text,
+                        'duration': duration,
+                    }
+                    
+                    # Render with themed renderer (code-based, consistent theme)
+                    scene_clip = render_themed_frame(themed_scene, width, height, request.prompt)
+                    final_scene_clip = scene_clip.with_audio(audio_clip)
+                    
+                    clips.append(final_scene_clip)
+                    total_duration += duration
+                    continue  # Skip other renderers
+                
+                # ═══════════════════════════════════════════════════════════════
+                # �🎬 AI-ENHANCED RENDERER (Beautiful flowcharts & visuals)
+                # ═══════════════════════════════════════════════════════════════
+                elif USE_AI_RENDERER:
+                    print(f"   🎬 Using AI RENDERER (scene_type={scene_type})")
+                    
+                    # Build scene with all necessary data
+                    ai_scene = {
+                        **scene,
+                        'scene_type': scene_type,
+                        'headline': headline,
+                        'narration': narration_text,
+                        'duration': duration,
+                    }
+                    
+                    # Render with AI-enhanced renderer (flowcharts, equations, etc.)
+                    scene_clip = render_ai_frame(ai_scene, width, height, request.prompt)
+                    final_scene_clip = scene_clip.with_audio(audio_clip)
+                    
+                    clips.append(final_scene_clip)
+                    total_duration += duration
+                    continue  # Skip other renderers
+                
+                # ═══════════════════════════════════════════════════════════════
+                # ✨ CLEAN RENDERER (No external APIs, 100% reliable)
+                # ═══════════════════════════════════════════════════════════════
+                elif USE_CLEAN_RENDERER:
+                    print(f"   ✨ Using CLEAN RENDERER (scene_type={scene_type})")
+                    
+                    # Build scene with all necessary data
+                    clean_scene = {
+                        **scene,
+                        'scene_type': scene_type,
+                        'headline': headline,
+                        'narration': narration_text,
+                        'duration': duration,
+                    }
+                    
+                    # Render with clean renderer (emoji icons, shapes, no API calls)
+                    scene_clip = render_clean_frame(clean_scene, width, height, request.prompt)
+                    final_scene_clip = scene_clip.with_audio(audio_clip)
+                    
+                    clips.append(final_scene_clip)
+                    total_duration += duration
+                    continue  # Skip other renderers
+                
+                # 🖼️ VISUAL RENDERER (Rich visuals with AI images, equations, etc.)
+                # ═══════════════════════════════════════════════════════════════
+                elif USE_VISUAL_RENDERER:
+                    print(f"   🖼️ Using VISUAL RENDERER with AI images")
+                    
+                    # Build scene with all necessary data
+                    visual_scene = {
+                        **scene,
+                        'scene_type': scene_type,
+                        'headline': headline,
+                        'narration': narration_text,
+                        'duration': duration,
+                    }
+                    
+                    # Render with visual renderer (includes AI image generation)
+                    scene_clip = render_visual_frame(visual_scene, width, height, request.prompt)
+                    final_scene_clip = scene_clip.with_audio(audio_clip)
+                    
+                    clips.append(final_scene_clip)
+                    total_duration += duration
+                    continue  # Skip other renderers
+                
+                # ═══════════════════════════════════════════════════════════════
+                # 🚀 SMART VIDEO ENGINE (Fallback)
+                # ═══════════════════════════════════════════════════════════════
+                elif USE_SMART_ENGINE:
+                    print(f"   🚀 Using SMART VIDEO ENGINE")
+                    
+                    # Classify the meaning of this scene (pass scene_type from AI for better accuracy)
+                    meaning, detected_frame_type = classify_meaning(narration_text, scene_type)
+                    print(f"   📊 Detected: scene_type={scene_type} → meaning={meaning} → frame={detected_frame_type.value}")
+                    
+                    # Generate unique style for this video
+                    video_style = VideoStyle.generate_for_topic(request.prompt)
+                    
+                    # Build scene data for modern renderer
+                    smart_scene = {
+                        **scene,
+                        'frame_type': detected_frame_type.value,
+                        'meaning': meaning,
+                        'headline': headline,
+                        'narration': narration_text,
+                        'duration': duration,
+                        'style': {
+                            'palette': video_style.palette_name,
+                            'colors': video_style.colors,
+                            'font_style': video_style.font_style,
+                            'box_style': video_style.box_style,
+                        }
+                    }
+                    
+                    # Render with modern renderer
+                    scene_clip = render_frame(smart_scene, width, height)
+                    final_scene_clip = scene_clip.with_audio(audio_clip)
+                    
+                    clips.append(final_scene_clip)
+                    total_duration += duration
+                    continue  # Skip old rendering
+                
+                # ═══════════════════════════════════════════════════════════════
+                # 🧠 SEMANTIC FRAME RENDERING (Old System - Fallback)
+                # ═══════════════════════════════════════════════════════════════
+                elif USE_SEMANTIC_FRAMING and frame_style in RENDERERS:
+                    print(f"   🧠 Using SEMANTIC RENDERER: {frame_style}")
+                    
+                    # Use semantic renderer for this layout type
+                    layers = render_semantic_frame(
+                        layout_type=frame_style,
+                        scene=scene,
+                        width=width,
+                        height=height,
+                        duration=duration,
+                        fetch_image_fn=fetch_image_for_topic
+                    )
+                    
+                    # Compose the final scene clip
+                    final_scene_clip = CompositeVideoClip([
+                        bg_clip,
+                        *layers
+                    ], size=(width, height)).with_audio(audio_clip)
+                    
+                    clips.append(final_scene_clip)
+                    total_duration += duration
+                    continue  # Skip the old rendering logic
+                
+                # ═══════════════════════════════════════════════════════════════
+                # 🎨 LEGACY RENDERING (Fallback if semantic not available)
+                # ═══════════════════════════════════════════════════════════════
+                layers = []
                 
                 # Get font (use system font)
                 font_path = "/System/Library/Fonts/Helvetica.ttc"
@@ -697,26 +1791,142 @@ CRITICAL RULES:
                 icon = scene.get('icon', '')
                 narration = scene.get('narration', '')
 
-                # === TITLE FRAME ===
+                # === TITLE FRAME (HOOK) ===
+                # Purpose: Grab attention in 1 second
+                # Layout: Big text centered + single icon
                 if frame_style == "title_frame":
-                    print(f"   → Rendering TITLE FRAME")
+                    print(f"   → Rendering TITLE FRAME (Hook)")
                     
-                    # Icon if provided
-                    if icon:
-                        icon_clip = TextClip(text=icon, font_size=100, color='white', font=font_path).with_duration(duration)
-                        icon_clip = icon_clip.with_position(('center', int(height * 0.3)))
+                    # Generate icon using Stable Diffusion
+                    print(f"   🖼️ Generating title icon for: {headline}...")
+                    img_path = fetch_image_for_topic(headline, width=int(width * 0.5), height=int(width * 0.5), scene_type="title")
+                    
+                    if img_path:
+                        img_clip = create_image_clip(img_path, int(width * 0.4), int(width * 0.4), duration)
+                        if img_clip:
+                            img_clip = img_clip.with_position(('center', int(height * 0.25)))
+                            layers.append(img_clip)
+                    elif icon:
+                        # Fallback to emoji icon
+                        icon_clip = TextClip(text=icon, font_size=120, color='white', font=font_path).with_duration(duration)
+                        icon_clip = icon_clip.with_position(('center', int(height * 0.30)))
                         layers.append(icon_clip)
                     
-                    # Main headline
-                    title_clip = TextClip(text=headline, font_size=85, color='white', font=font_path).with_duration(duration)
-                    title_clip = title_clip.with_position(('center', int(height * 0.42)))
+                    # Main headline (HEADLINE ZONE - top area)
+                    title_clip = TextClip(text=headline, font_size=90, color='white', font=font_path).with_duration(duration)
+                    title_clip = title_clip.with_position(('center', int(height * 0.52)))
                     
                     # Accent underline
-                    underline_w = min(len(headline) * 45, width - 200)
-                    underline = ColorClip(size=(underline_w, 6), color=accent_color, duration=duration)
-                    underline = underline.with_position(('center', int(height * 0.50)))
+                    underline_w = min(len(headline) * 50, width - 150)
+                    underline = ColorClip(size=(underline_w, 8), color=accent_color, duration=duration)
+                    underline = underline.with_position(('center', int(height * 0.60)))
                     
                     layers.extend([title_clip, underline])
+                    
+                    # Support text (optional subtitle)
+                    if narration and len(narration) < 50:
+                        support_clip = TextClip(
+                            text=narration, font_size=32, color='#888888', font=font_path
+                        ).with_duration(duration)
+                        support_clip = support_clip.with_position(('center', int(height * 0.68)))
+                        layers.append(support_clip)
+
+                # === INPUTS FRAME ===
+                # Purpose: Show ingredients / requirements (what goes in)
+                # Layout: 3 icons evenly spaced in VISUAL ZONE
+                elif frame_style == "inputs_frame":
+                    print(f"   → Rendering INPUTS FRAME")
+                    
+                    # Headline at top
+                    head_clip = TextClip(text="INPUTS", font_size=70, color='white', font=font_path).with_duration(duration)
+                    head_clip = head_clip.with_position(('center', int(height * 0.10)))
+                    layers.append(head_clip)
+                    
+                    # Get input items
+                    input_items = scene.get('input_items', scene.get('visual_elements', []))
+                    if not input_items and narration:
+                        # Extract from narration
+                        input_items = [narration[:20]]
+                    
+                    # Generate icons for each input (max 3)
+                    num_inputs = min(len(input_items), 3) if input_items else 1
+                    icon_size = int(width * 0.25)
+                    spacing = width // (num_inputs + 1)
+                    
+                    for idx, item in enumerate(input_items[:3]):
+                        x_pos = spacing * (idx + 1) - icon_size // 2
+                        
+                        # Try to generate AI icon for this input
+                        print(f"   🖼️ Generating input icon {idx+1}: {str(item)[:20]}...")
+                        img_path = fetch_image_for_topic(str(item), width=icon_size, height=icon_size, scene_type="inputs")
+                        
+                        if img_path:
+                            img_clip = create_image_clip(img_path, icon_size, icon_size, duration)
+                            if img_clip:
+                                img_clip = img_clip.with_position((x_pos, int(height * 0.30)))
+                                layers.append(img_clip)
+                        else:
+                            # Fallback: colored circle with text
+                            circle = ColorClip(size=(icon_size, icon_size), color=accent_color, duration=duration)
+                            circle = circle.with_position((x_pos, int(height * 0.30)))
+                            layers.append(circle)
+                        
+                        # Label below icon
+                        label = TextClip(
+                            text=truncate_text(str(item), 12), font_size=28, color='white', font=font_path
+                        ).with_duration(duration)
+                        label = label.with_position((x_pos + icon_size // 4, int(height * 0.55)))
+                        layers.append(label)
+                    
+                    # Support text
+                    support_clip = TextClip(
+                        text=truncate_text(narration, 40), font_size=30, color='#888888', font=font_path
+                    ).with_duration(duration)
+                    support_clip = support_clip.with_position(('center', int(height * 0.75)))
+                    layers.append(support_clip)
+
+                # === OUTPUT FRAME ===
+                # Purpose: Show result clearly (what comes out)
+                # Layout: Arrows moving outward, bright accent
+                elif frame_style == "output_frame":
+                    print(f"   → Rendering OUTPUT FRAME")
+                    
+                    # Headline at top
+                    head_clip = TextClip(text="OUTPUT", font_size=70, color='white', font=font_path).with_duration(duration)
+                    head_clip = head_clip.with_position(('center', int(height * 0.10)))
+                    layers.append(head_clip)
+                    
+                    # Get output items
+                    output_items = scene.get('output_items', scene.get('visual_elements', [headline]))
+                    
+                    # Generate icon for the output
+                    output_query = " ".join(str(o) for o in output_items[:2]) if output_items else headline
+                    print(f"   🖼️ Generating output icon: {output_query[:30]}...")
+                    img_path = fetch_image_for_topic(output_query, width=int(width * 0.5), height=int(width * 0.5), scene_type="output")
+                    
+                    if img_path:
+                        img_clip = create_image_clip(img_path, int(width * 0.45), int(width * 0.45), duration)
+                        if img_clip:
+                            img_clip = img_clip.with_position(('center', int(height * 0.28)))
+                            layers.append(img_clip)
+                    
+                    # Output labels with outward arrows
+                    if output_items:
+                        y_pos = int(height * 0.58)
+                        for idx, item in enumerate(output_items[:2]):
+                            arrow_text = f"→ {truncate_text(str(item), 20)}"
+                            item_clip = TextClip(
+                                text=arrow_text, font_size=40, color=accent_color, font=font_path
+                            ).with_duration(duration)
+                            item_clip = item_clip.with_position(('center', y_pos + idx * 60))
+                            layers.append(item_clip)
+                    
+                    # Support text
+                    support_clip = TextClip(
+                        text=truncate_text(narration, 50), font_size=28, color='#888888', font=font_path
+                    ).with_duration(duration)
+                    support_clip = support_clip.with_position(('center', int(height * 0.78)))
+                    layers.append(support_clip)
 
                 # === DEFINITION FRAME ===
                 elif frame_style == "definition_frame":
@@ -727,9 +1937,9 @@ CRITICAL RULES:
                     term_clip = term_clip.with_position(('center', int(height * 0.08)))
                     layers.append(term_clip)
                     
-                    # Fetch image for the term
-                    print(f"   🖼️ Fetching definition image for: {headline}...")
-                    img_path = fetch_image_for_topic(headline, width=int(width * 0.8), height=int(height * 0.30))
+                    # Fetch AI-generated image for the term
+                    print(f"   🖼️ Generating definition image for: {headline}...")
+                    img_path = fetch_image_for_topic(headline, width=int(width * 0.8), height=int(height * 0.30), scene_type="definition")
                     
                     if img_path:
                         img_clip = create_image_clip(img_path, int(width * 0.8), int(height * 0.30), duration)
@@ -754,23 +1964,18 @@ CRITICAL RULES:
                     head_clip = head_clip.with_position(('center', int(height * 0.08)))
                     layers.append(head_clip)
                     
-                    # Fetch relevant image for the topic
+                    # Generate AI image for the explanation
                     image_query = f"{headline} {narration[:30]}"
-                    print(f"   🖼️ Fetching image for: {image_query[:40]}...")
-                    img_path = fetch_image_for_topic(image_query, width=int(width * 0.85), height=int(height * 0.35))
+                    print(f"   🖼️ Generating explanation image for: {image_query[:40]}...")
+                    img_path = fetch_image_for_topic(image_query, width=int(width * 0.85), height=int(height * 0.35), scene_type="explanation")
                     
                     if img_path:
                         img_clip = create_image_clip(img_path, int(width * 0.85), int(height * 0.35), duration)
                         if img_clip:
                             img_clip = img_clip.with_position(('center', int(height * 0.18)))
                             layers.append(img_clip)
-                    else:
-                        # Fallback to accent box if no image
-                        box = ColorClip(size=(int(width * 0.7), 180), color=accent_color, duration=duration)
-                        box = box.with_position(('center', int(height * 0.35)))
-                        layers.append(box)
                     
-                    # Narration text at bottom
+                    # Narration text at bottom (no colored box fallback)
                     text_clip = TextClip(
                         text=narration[:120], font_size=38, color='#DDDDDD', font=font_path,
                         method='caption', size=(width - 120, None)
@@ -1155,78 +2360,41 @@ CRITICAL RULES:
                     narr_clip = narr_clip.with_position(('center', int(height * 0.7)))
                     layers.append(narr_clip)
 
-                # === FLOWCHART FRAME (nodes with connections) ===
+                # === FLOWCHART FRAME (AI-generated flowchart image) ===
                 elif frame_style == "flowchart_frame":
                     print(f"   → Rendering FLOWCHART FRAME")
                     
-                    # Get flowchart data
+                    # Get flowchart data for the prompt
                     flow_nodes = scene.get('flow_nodes', [])
-                    flow_connections = scene.get('flow_connections', [])
+                    steps_desc = " → ".join([str(n.get('text', f'Step {i}'))[:20] for i, n in enumerate(flow_nodes[:5])]) if flow_nodes else ""
+                    if not steps_desc and steps:
+                        steps_desc = " → ".join([str(s)[:20] for s in steps[:5]])
                     
                     # Headline at top
                     head_clip = TextClip(
                         text=truncate_text(headline, 20), 
                         font_size=50, color='white', font=font_path
                     ).with_duration(duration)
-                    head_clip = head_clip.with_position(('center', int(height * 0.08)))
+                    head_clip = head_clip.with_position(('center', int(height * 0.06)))
                     layers.append(head_clip)
                     
-                    # If no flow_nodes, create from steps
-                    if not flow_nodes and steps:
-                        flow_nodes = [{"id": i+1, "text": s, "type": "process"} for i, s in enumerate(steps[:4])]
-                    elif not flow_nodes:
-                        flow_nodes = [
-                            {"id": 1, "text": "Input", "type": "input"},
-                            {"id": 2, "text": "Process", "type": "process"},
-                            {"id": 3, "text": "Output", "type": "output"}
-                        ]
+                    # Generate AI flowchart image
+                    flowchart_query = f"{headline}: {steps_desc}" if steps_desc else headline
+                    print(f"   🖼️ Generating flowchart for: {flowchart_query[:50]}...")
+                    img_path = fetch_image_for_topic(flowchart_query, width=int(width * 0.9), height=int(height * 0.55), scene_type="flowchart")
                     
-                    # Layout nodes vertically for mobile
-                    num_nodes = min(len(flow_nodes), 4)
-                    node_height = 90
-                    node_width = int(width * 0.7)
-                    y_start = int(height * 0.18)
-                    spacing = int((height * 0.6) / max(num_nodes, 1))
-                    
-                    # Colors for node types
-                    node_colors = {
-                        "input": (78, 205, 196),    # Teal
-                        "process": accent_color,
-                        "output": (0, 255, 136),    # Green
-                    }
-                    
-                    for idx, node in enumerate(flow_nodes[:4]):
-                        node_text = truncate_text(str(node.get('text', f'Step {idx+1}')), 25)
-                        node_type = node.get('type', 'process')
-                        node_color = node_colors.get(node_type, accent_color)
-                        
-                        y_pos = y_start + idx * spacing
-                        x_pos = int((width - node_width) / 2)
-                        
-                        # Node box
-                        node_box = ColorClip(size=(node_width, node_height), color=node_color, duration=duration)
-                        node_box = node_box.with_position((x_pos, y_pos))
-                        layers.append(node_box)
-                        
-                        # Node text
-                        text_clip = TextClip(
-                            text=node_text, font_size=32, color='white', font=font_path
-                        ).with_duration(duration)
-                        text_clip = text_clip.with_position((x_pos + 20, y_pos + 30))
-                        layers.append(text_clip)
-                        
-                        # Arrow to next node
-                        if idx < num_nodes - 1:
-                            arrow = TextClip(text="↓", font_size=50, color='white', font=font_path).with_duration(duration)
-                            arrow = arrow.with_position(('center', y_pos + node_height + 5))
-                            layers.append(arrow)
+                    if img_path:
+                        img_clip = create_image_clip(img_path, int(width * 0.9), int(height * 0.55), duration)
+                        if img_clip:
+                            img_clip = img_clip.with_position(('center', int(height * 0.14)))
+                            layers.append(img_clip)
                     
                     # Narration at bottom
                     narr_clip = TextClip(
-                        text=truncate_text(narration, 60), font_size=28, color='#AAAAAA', font=font_path,
-                        method='caption', size=(width - 80, None)
+                        text=truncate_text(narration, 80), font_size=32, color='#CCCCCC', font=font_path,
+                        method='caption', size=(width - 100, None)
                     ).with_duration(duration)
-                    narr_clip = narr_clip.with_position(('center', int(height * 0.85)))
+                    narr_clip = narr_clip.with_position(('center', int(height * 0.75)))
                     layers.append(narr_clip)
 
                 # === TIMELINE FRAME ===
@@ -1300,7 +2468,7 @@ CRITICAL RULES:
                         num_elements = min(len(diagram_elements), 4)
                         elem_w = int((width - 100) / min(num_elements, 2)) - 20
                         elem_h = 70
-                        y_elem = int(height * 0.55)
+                        y_elem = int(height * 0.55);
                         
                         for idx, elem in enumerate(diagram_elements[:4]):
                             row = idx // 2
@@ -1346,30 +2514,18 @@ CRITICAL RULES:
                     head_clip = head_clip.with_position(('center', int(height * 0.12)))
                     layers.append(head_clip)
                     
-                    # Fetch relevant image for the example
+                    # Generate AI image for the example (real-world illustration)
                     image_query = f"{headline} {example_text or narration[:20]}"
-                    print(f"   🖼️ Fetching example image for: {image_query[:40]}...")
-                    img_path = fetch_image_for_topic(image_query, width=int(width * 0.85), height=int(height * 0.35))
+                    print(f"   🖼️ Generating example image for: {image_query[:40]}...")
+                    img_path = fetch_image_for_topic(image_query, width=int(width * 0.85), height=int(height * 0.35), scene_type="example")
                     
                     if img_path:
                         img_clip = create_image_clip(img_path, int(width * 0.85), int(height * 0.35), duration)
                         if img_clip:
                             img_clip = img_clip.with_position(('center', int(height * 0.22)))
                             layers.append(img_clip)
-                    else:
-                        # Fallback to colored box
-                        box = ColorClip(size=(int(width * 0.85), 150), color=(40, 45, 55), duration=duration)
-                        box = box.with_position(('center', int(height * 0.38)))
-                        layers.append(box)
-                        
-                        if example_text:
-                            ex_clip = TextClip(
-                                text=truncate_text(example_text, 35), font_size=36, color=accent_color, font=font_path
-                            ).with_duration(duration)
-                            ex_clip = ex_clip.with_position(('center', int(height * 0.42)))
-                            layers.append(ex_clip)
                     
-                    # Narration below
+                    # Narration below (no colored box fallback)
                     narr_clip = TextClip(
                         text=truncate_text(narration, 80), font_size=32, color='#CCCCCC', font=font_path,
                         method='caption', size=(width - 100, None)
@@ -1446,10 +2602,40 @@ CRITICAL RULES:
                 clips.append(final_scene_clip)
                 total_duration += duration
 
-            # Concatenate all scenes
-            final_video = concatenate_videoclips(clips, method="compose")
+            final_video = None
+            mc_url = None # Initialize variable
+            if USE_MOTION_CANVAS:
+                from moviepy import VideoFileClip, concatenate_audioclips
+                log_header("🎨 STARTING MOTION CANVAS RENDER")
+                
+                # Generate Project
+                current_theme = get_current_theme()
+                project_dir = generate_motion_canvas_project(processed_scenes, current_theme, script_data['title'])
+                
+                # Render Video / Start Server
+                # We moved to "Serve Mode" - render_motion_canvas_video was standardized to serving
+                mc_url = serve_motion_canvas_project(project_dir)
+                
+                # We no longer generate a placeholder video here. 
+                # Instead, we allow the pipeline to continue to the standard renderer
+                # so the user gets a real video file to view/download while the 
+                # Motion Canvas interactive preview is also available.
+                print(f"\nℹ️  Motion Canvas Project launching at: {mc_url}")
+                print(f"   👉 Project saved at: {project_dir}")
+                
+                # We leave final_video as None so it falls through to the standard renderer below
+                final_video = None
+                
+            if final_video is None:
+                # Concatenate all scenes (Standard Renderer Fallback)
+                print("Using standard renderer fallback...")
+                if clips:
+                    final_video = concatenate_videoclips(clips, method="compose")
+                else:
+                    print("❌ Error: No clips generated for fallback. Creating error video.")
+                    final_video = TextClip(text="Video Generation Failed\nNo frames rendered", font_size=50, color='red', size=(width, height), method='caption').with_duration(5)
             output_filename = f"{video_id}.mp4"
-            output_path = f"backend/output/{output_filename}"
+            output_path = f"output/{output_filename}"
             
             # Write video file
             print(f"\n📹 Encoding final video...")
@@ -1460,21 +2646,27 @@ CRITICAL RULES:
             # ══════════════════════════════════════════════════════════════════
             log_header("✅ VIDEO GENERATION COMPLETE")
             print(f"🎬 Title: {script_data['title']}")
-            print(f"⏱️  Total Duration: {total_duration:.1f}s")
+            print(f"⏱️  Total Duration: {final_video.duration if final_video else total_duration:.1f}s")
             print(f"📁 Output: {output_path}")
             print(f"🌐 URL: http://localhost:8000/output/{output_filename}")
             log_separator()
             
-            return VideoResponse(
-                video_url=f"http://localhost:8000/output/{output_filename}",
-                title=script_data['title'],
-                duration=total_duration
-            )
+            return {
+                "status": "success",
+                "video_id": video_id,
+                "title": script_data['title'],
+                "duration": final_video.duration if final_video else total_duration,
+                "video_url": f"{BASE_URL}/output/{output_filename}",
+                "motion_canvas_url": mc_url
+            }
             
         except Exception as e:
             import traceback
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=str(e))
+
+# Register script endpoints for review/edit workflow
+register_script_endpoints(app)
 
 if __name__ == "__main__":
     import uvicorn
