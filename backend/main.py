@@ -36,33 +36,181 @@ if not API_KEY:
     except ImportError:
         raise ValueError("OPENROUTER_API_KEY not found in environment or app_secrets.py")
 
+# OpenAI API Key for DALL-E image generation
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    try:
+        from app_secrets import OPENAI_API_KEY
+    except ImportError:
+        OPENAI_API_KEY = None
+        print("⚠️ OPENAI_API_KEY not found - will use Unsplash for images instead of DALL-E")
+
 # Create directories if they don't exist
 os.makedirs("backend/output", exist_ok=True)
 os.makedirs("backend/temp/audio", exist_ok=True)
 os.makedirs("backend/temp/images", exist_ok=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 🖼️ IMAGE FETCHING - Get relevant images for topics
+# 🖼️ IMAGE GENERATION - Use OpenRouter API for AI image generation
 # ══════════════════════════════════════════════════════════════════════════════
 
-def fetch_image_for_topic(query: str, width: int = 600, height: int = 400) -> str:
-    """Fetch a relevant image from Unsplash for the given topic"""
+def generate_image_openrouter(prompt: str) -> str:
+    """Generate an image using OpenRouter API (Gemini image models via chat completions)"""
     try:
-        # Use Unsplash Source (free, no API key needed)
-        # Clean query for URL
+        print(f"   🎨 Generating AI image: {prompt[:50]}...")
+        
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost:8000",
+                "X-Title": "Aetheris Video Generator"
+            },
+            json={
+                "model": "google/gemini-2.5-flash-image",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"Create a simple illustration: {prompt}"
+                    }
+                ],
+                "max_tokens": 2000  # Limit tokens to stay within credit budget
+            },
+            timeout=90
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            # Extract image from message content
+            if data.get("choices") and len(data["choices"]) > 0:
+                message = data["choices"][0].get("message", {})
+                images = message.get("images", [])
+                
+                if images and len(images) > 0:
+                    image_data = images[0]
+                    image_url = None
+                    
+                    # Handle nested image_url structure
+                    if isinstance(image_data, dict):
+                        if image_data.get("image_url"):
+                            image_url = image_data["image_url"].get("url")
+                        elif image_data.get("url"):
+                            image_url = image_data.get("url")
+                    
+                    if image_url:
+                        # Check if it's base64 data URL
+                        if image_url.startswith("data:image"):
+                            import base64
+                            # Extract base64 data after the comma
+                            header, b64_data = image_url.split(",", 1)
+                            img_bytes = base64.b64decode(b64_data)
+                            img_path = f"backend/temp/images/{uuid.uuid4()}.png"
+                            with open(img_path, 'wb') as f:
+                                f.write(img_bytes)
+                            print(f"   ✅ AI image saved: {img_path}")
+                            return img_path
+                        else:
+                            # Regular URL - download it
+                            img_response = requests.get(image_url, timeout=30)
+                            if img_response.status_code == 200:
+                                img_path = f"backend/temp/images/{uuid.uuid4()}.png"
+                                with open(img_path, 'wb') as f:
+                                    f.write(img_response.content)
+                                print(f"   ✅ AI image saved: {img_path}")
+                                return img_path
+                else:
+                    print(f"   ⚠️ No images in response")
+        else:
+            error_msg = response.text[:200] if response.text else "Unknown error"
+            print(f"   ⚠️ OpenRouter image error ({response.status_code}): {error_msg}")
+    except Exception as e:
+        print(f"   ⚠️ Image generation failed: {e}")
+    
+    return None
+
+def generate_dalle_image(prompt: str, size: str = "1024x1024") -> str:
+    """Generate an image using OpenAI DALL-E 3 (fallback)"""
+    if not OPENAI_API_KEY:
+        return None
+    
+    try:
+        print(f"   🎨 Trying DALL-E: {prompt[:50]}...")
+        
+        response = requests.post(
+            "https://api.openai.com/v1/images/generations",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "dall-e-3",
+                "prompt": f"Educational illustration, clean modern style, minimalist: {prompt}",
+                "n": 1,
+                "size": size,
+                "quality": "standard"
+            },
+            timeout=60
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            image_url = data["data"][0]["url"]
+            
+            img_response = requests.get(image_url, timeout=30)
+            if img_response.status_code == 200:
+                img_path = f"backend/temp/images/{uuid.uuid4()}.png"
+                with open(img_path, 'wb') as f:
+                    f.write(img_response.content)
+                print(f"   ✅ DALL-E image saved")
+                return img_path
+        else:
+            print(f"   ⚠️ DALL-E error: {response.status_code}")
+    except Exception as e:
+        print(f"   ⚠️ DALL-E failed: {e}")
+    
+    return None
+
+def fetch_stock_image(query: str, width: int = 600, height: int = 400) -> str:
+    """Fetch stock image from Unsplash (free fallback)"""
+    try:
+        print(f"   📷 Fetching stock image: {query[:40]}...")
         clean_query = query.replace(" ", ",").lower()[:50]
         image_url = f"https://source.unsplash.com/{width}x{height}/?{clean_query}"
         
-        response = requests.get(image_url, timeout=10)
-        if response.status_code == 200:
-            # Save image temporarily
+        response = requests.get(image_url, timeout=10, allow_redirects=True)
+        if response.status_code == 200 and len(response.content) > 1000:
             img_path = f"backend/temp/images/{uuid.uuid4()}.jpg"
             with open(img_path, 'wb') as f:
                 f.write(response.content)
+            print(f"   ✅ Stock image saved")
             return img_path
     except Exception as e:
-        print(f"   ⚠️ Could not fetch image: {e}")
+        print(f"   ⚠️ Stock image failed: {e}")
     
+    return None
+
+def fetch_image_for_topic(query: str, width: int = 600, height: int = 400, use_ai: bool = True) -> str:
+    """Fetch image - tries OpenRouter AI first, then DALL-E, then stock images"""
+    
+    # 1. Try OpenRouter image generation (uses same API key as text)
+    if use_ai:
+        ai_path = generate_image_openrouter(query)
+        if ai_path:
+            return ai_path
+    
+    # 2. Try DALL-E if OpenAI key available
+    if OPENAI_API_KEY:
+        dalle_path = generate_dalle_image(query, "1024x1024")
+        if dalle_path:
+            return dalle_path
+    
+    # 3. Fallback to stock images
+    stock_path = fetch_stock_image(query, width, height)
+    if stock_path:
+        return stock_path
+    
+    print(f"   ⚠️ No image found for: {query[:30]}")
     return None
 
 def create_image_clip(image_path: str, target_width: int, target_height: int, duration: float):
